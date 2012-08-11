@@ -13,7 +13,7 @@ USERNAME = 'gstech'
 PASSWORD = 'zpnr5974'
 API_KEY = 'QX86F96ZNM6KGSW'
 
-connect('vinhistory', 'mongodb://JJ:2berlin@ds035617.mongolab.com:35617/garafa')
+connect('vinhistory', host="mongodb://jdotjdot:virginia@ds035617.mongolab.com:35617/garafa")
 
 def MAIN_URL(_type):
 	'''This function takes one of the following:
@@ -142,6 +142,9 @@ class Car(DynamicDocument):
 	datetime_pulled = DateTimeField()
 
 if __name__ == '__main__':
+
+	# command line: vinaudit.py <VIN> <VIN> ...
+
 	if len(sys.argv) > 1:
 		for _input in sys.argv[1:]:
 			GetCarInformation(_input)
