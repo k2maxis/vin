@@ -254,7 +254,8 @@ if __name__ == '__main__':
 			error_items[category].append(idnum)
 
 		def end(ignore):
-			print "\n\nThe following items were successfully run:\n"
+			print "\n\n-------------PROGRAM SUMMARY-------------n"
+			print "\nThe following items were successfully run:\n"
 			if run_items['vins']:
 				print "VINs:\n"
 				pprint.pprint(run_items['vins'], indent=2, depth=2)
