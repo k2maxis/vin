@@ -1,0 +1,3 @@
+LIBRARY _zope_interface_coptimizations.pyd
+EXPORTS
+init_zope_interface_coptimizations

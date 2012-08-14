@@ -5,10 +5,13 @@
 #	(1) Concurrency, so that calling the program with
 #		multiple VINs and/or report IDs allows for asynchornous
 #		data pulling.
+#   (2) Add database to store VINs that haven't worked for whatever reason,
+#		especially those that are invalid VINs or aren't available in
+#		the database.
 
 # http://www.vinaudit.com/api-documentation
 
-import json, urllib, urllib2, time, datetime, sys, argparse
+import json, urllib, urllib2, time, datetime, sys, argparse, pprint
 from mongoengine import *
 
 USERNAME = 'gstech'
@@ -53,7 +56,10 @@ def Query(vin):
 		elif results['error'] == 'fail_nmvtis':
 			raise FailNMVTISError, "Failed to reach NMVTIS."
 		elif results['error'] == 'no_records':
-			print "No record exists in NMVTIS for VIN %s" % vin
+			if all_input.not_async:
+				print "No record exists in NMVTIS for VIN %s" % vin
+			else:
+				raise NoRecordsError, "No record exists in NMVTIS for VIN %s" % vin
 
 		return False
 
@@ -199,6 +205,9 @@ if __name__ == '__main__':
 
 	parser.add_argument('VINs', action="store", nargs='*', 
 		help="List of VINs to report.")
+	parser.add_argument('--not_asynchronously', '-na', action='store_true',
+		default=False, dest="not_async",
+		help="Turns off asynchronous evaluation for multiple arguments.")
 	parser.add_argument('--reports', '-r', action="store", 
 		nargs="*", dest="reports",
 		help="List of already purchased reports to get.")
@@ -210,9 +219,121 @@ if __name__ == '__main__':
 
 	DEBUG = all_input.debug
 
-	if all_input.VINs:
-		for _input in all_input.VINs:
-			GetCarInformation(_input)
-	if all_input.reports:
-		for _input in all_input.reports:
-			GetCarInformation(report_id = _input)
+	if all_input.not_async:
+		if all_input.VINs:
+			for _input in all_input.VINs:
+				GetCarInformation(_input)
+		if all_input.reports:
+			for _input in all_input.reports:
+				GetCarInformation(report_id = _input)
+
+	#################################################
+	### ASYNCHRONOUS CODE
+	#################################################
+
+	else:
+		import collections
+		from twisted.internet import reactor, defer, threads
+		from twisted.python import failure
+
+		vin_count = 0 # Probably deprecated; remove this
+		balance_ok = True
+		run_items = {'vins': [], 'reports': []}
+		error_items = collections.defaultdict(list)
+
+		def callprint(ignore, x):
+			print x
+
+		def addrunitem(ignore, idnum, report=False):
+			if report:
+				run_items['reports'].append(idnum)
+			else:
+				run_items['vins'].append(idnum)
+
+		def adderroritem(ignore, idnum, category):
+			error_items[category].append(idnum)
+
+		def end(ignore):
+			print "\n\nThe following items were successfully run:\n"
+			if run_items['vins']:
+				print "VINs:\n"
+				pprint.pprint(run_items['vins'], indent=2, depth=2)
+			if run_items['reports']:
+				print "Reports:\n"
+				pprint.pprint(run_items['reports'], indent=2, depth=2)
+
+			print "\n\nThe following items were NOT run:\n"
+
+			for item in error_items:
+				print item + ":\n"
+				pprint.pprint(error_items[item], indent=2, depth=2)
+
+			reactor.stop()
+
+		def handle_various_errors(failure, vin_or_report, _id):
+
+			# Do I actually need vin_or_report?
+
+			if failure.check(NoBalanceError):
+				balance_ok = False
+				print "No balance remaining: no more VINs will be run."
+				error_items['not_attempted'].append(_id)
+
+			elif failure.check(InvalidVINError):
+				print _id + " is an invalid " + vin_or_report
+				error_items['invalid_vin'].append(_id)
+
+			elif failure.check(FailNMVTISError):
+				print _id + " was not run, NMVTIS was not available."
+				error_items['fail_nmvtis'].append(_id)
+
+			elif failure.check(NoRecordsError):
+				print _id + " did not exist in the NMVTIS database."
+				error_items['no_record'].append(_id)
+
+			else:
+				failure.raiseException()
+
+
+		def deferred_GetCarInformation(vin=None, report_id=None):
+
+			# Maybe should rewrite much of this function to not have
+			#  to have all of these "vin if vin else report_id", etc.
+
+			if vin and report_id:
+				raise Exception, "Shouldn't supply both arguments"
+
+			if vin and balance_ok:
+				d = threads.deferToThread(GetCarInformation,
+										  vin = vin)
+			elif report_id:
+				d = threads.deferToThread(GetCarInformation,
+										  report_id = report_id)
+
+			# I'm not sure this will actually ever come up,
+			#  since the DeferredList is set up before any of the VIN functions
+			#  is actually executed, so `balance_ok` will always remain True
+			elif vin and not balance_ok:
+				d.addCallback(adderroritem, vin, 'not_attempted')
+				return d
+
+			d.addCallback(callprint, "Ran for %s %s" % ('VIN' if vin else 'report ID',
+														vin if vin else report_id)
+						 )
+
+			# Adds the id to the list of successfully run items
+			d.addCallback(addrunitem, vin if vin else report_id, True if report_id else False)
+
+			d.addErrback(handle_various_errors, 'VIN' if vin else 'report ID',
+												    vin if vin else report_id)
+
+			return d
+
+		dl=[]
+		if all_input.VINs:
+			dl.extend([deferred_GetCarInformation(vin=x) for x in all_input.VINs])
+		if all_input.reports:
+			dl.extend([deferred_GetCarInformation(report_id=x) for x in all_input.reports])
+		dl = defer.DeferredList(dl)
+		dl.addCallback(end)
+		reactor.run()

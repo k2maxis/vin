@@ -1,0 +1,55 @@
+def largeFibonnaciNumber(TARGET):
+    """
+    Represent a long running blocking function by calculating
+    the TARGETth Fibonnaci number
+    """
+
+    raise IOError, "why not?"
+
+    first = 0
+    second = 1
+
+    for i in xrange(TARGET - 1):
+        new = first + second
+        first = second
+        second = new
+
+    return second
+
+from twisted.internet import threads, reactor, defer
+
+def fibonacciCallback(result):
+    """
+    Callback which manages the largeFibonnaciNumber result by
+    printing it out
+    """
+    print "largeFibonnaciNumber result =", result
+    # make sure the reactor stops after the callback chain finishes,
+    # just so that this example terminates
+    #reactor.stop()
+
+def printline(ignore, x):
+    print x
+    if x == 'done':
+        reactor.stop()
+
+def run(target):
+    """
+    Run a series of operations, deferring the largeFibonnaciNumber
+    operation to a thread and performing some other operations after
+    adding the callback
+    """
+    # get our Deferred which will be called with the largeFibonnaciNumber result
+    d = threads.deferToThread(largeFibonnaciNumber, target)
+    # add our callback to print it out
+    d.addCallback(fibonacciCallback)
+    d.addCallback(printline, "ran " + str(target))
+    d.addErrback(printline, "freaking error!")
+    print "1st line after the addition of the callback"
+    print "2nd line after the addition of the callback"
+    return d
+
+if __name__ == '__main__':
+    dl = defer.DeferredList([run(10000), run(10)], consumeErrors=True)
+    dl.addCallback(printline, 'done')
+    reactor.run()
