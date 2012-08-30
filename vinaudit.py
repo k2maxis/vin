@@ -241,6 +241,8 @@ if __name__ == '__main__':
 		run_items = {'vins': [], 'reports': []}
 		error_items = collections.defaultdict(list)
 
+		# `ignore` argument because twisted always passes the calling
+		#  function's results as the first argument to the callback		
 		def callprint(ignore, x):
 			print x
 
