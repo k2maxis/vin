@@ -16,8 +16,9 @@
 
 .. seealso:: Module :mod:`~pymongo.master_slave_connection` for
    connecting to master-slave clusters, and
-   :doc:`/examples/replica_set` for an example of how to connect to a
-   replica set.
+   :doc:`/examples/high_availability` for an example of how to connect
+   to a replica set, or specify a list of mongos instances for automatic
+   failover.
 
 To get a :class:`~pymongo.database.Database` instance from a
 :class:`Connection` use either dictionary-style or attribute-style
@@ -34,8 +35,10 @@ access:
 """
 
 import datetime
+import random
 import socket
 import struct
+import time
 import warnings
 
 from bson.py3compat import b
@@ -130,7 +133,7 @@ class Connection(common.BaseObject):
           Other optional parameters can be passed as keyword arguments:
 
           - `safe`: Use getlasterror for each write operation?
-          - `j` or `journal`: Block until write operations have been commited
+          - `j` or `journal`: Block until write operations have been committed
             to the journal. Ignored if the server is running without journaling.
             Implies safe=True.
           - `w`: (integer or string) If this is a replica set write operations
@@ -154,7 +157,8 @@ class Connection(common.BaseObject):
             before timing out.
           - `ssl`: If True, create the connection to the server using SSL.
           - `read_preference`: The read preference for this connection.
-            See :class:`~pymongo.ReadPreference` for available options.
+            See :class:`~pymongo.read_preferences.ReadPreference` for available
+            options.
           - `auto_start_request`: If True (the default), each thread that
             accesses this Connection has a socket allocated to it for the
             thread's lifetime.  This ensures consistent reads, even if you read
@@ -166,6 +170,8 @@ class Connection(common.BaseObject):
             instead.
 
         .. seealso:: :meth:`end_request`
+        .. versionchanged:: 2.3
+           Added support for failover between mongos seed list members.
         .. versionchanged:: 2.2
            Added `auto_start_request` option back. Added `use_greenlets`
            option.
@@ -202,7 +208,7 @@ class Connection(common.BaseObject):
         if not isinstance(port, int):
             raise TypeError("port must be an instance of int")
 
-        nodes = set()
+        seeds = set()
         username = None
         password = None
         db = None
@@ -211,7 +217,7 @@ class Connection(common.BaseObject):
             if "://" in entity:
                 if entity.startswith("mongodb://"):
                     res = uri_parser.parse_uri(entity, port)
-                    nodes.update(res["nodelist"])
+                    seeds.update(res["nodelist"])
                     username = res["username"] or username
                     password = res["password"] or password
                     db = res["database"] or db
@@ -221,13 +227,15 @@ class Connection(common.BaseObject):
                     raise InvalidURI("Invalid URI scheme: "
                                      "%s" % (entity[:idx],))
             else:
-                nodes.update(uri_parser.split_hosts(entity, port))
-        if not nodes:
+                seeds.update(uri_parser.split_hosts(entity, port))
+        if not seeds:
             raise ConfigurationError("need to specify at least one host")
 
-        self.__nodes = nodes
+        self.__nodes = seeds
         self.__host = None
         self.__port = None
+        self.__is_primary = False
+        self.__is_mongos = False
 
         for option, value in kwargs.iteritems():
             option, value = common.validate(option, value)
@@ -239,6 +247,11 @@ class Connection(common.BaseObject):
         self.__cursor_manager = CursorManager(self)
 
         self.__repl = options.get('replicaset')
+        if len(seeds) == 1 and not self.__repl:
+            self.__direct = True
+        else:
+            self.__direct = False
+            self.__nodes = set()
 
         if network_timeout is not None:
             if (not isinstance(network_timeout, (int, float)) or
@@ -287,7 +300,7 @@ class Connection(common.BaseObject):
                           "use read_preference instead.", DeprecationWarning)
 
         if _connect:
-            self.__find_node()
+            self.__find_node(seeds)
 
         if db and username is None:
             warnings.warn("must provide a username and password "
@@ -307,11 +320,11 @@ class Connection(common.BaseObject):
                 index in cache[dbname][coll] and
                 now < cache[dbname][coll][index])
 
-    def _cache_index(self, database, collection, index, ttl):
+    def _cache_index(self, database, collection, index, cache_for):
         """Add an index to the index cache for ensure_index operations.
         """
         now = datetime.datetime.utcnow()
-        expire = datetime.timedelta(seconds=ttl) + now
+        expire = datetime.timedelta(seconds=cache_for) + now
 
         if database not in self.__index_cache:
             self.__index_cache[database] = {}
@@ -421,6 +434,23 @@ class Connection(common.BaseObject):
         return self.__port
 
     @property
+    def is_primary(self):
+        """If this Connection is connected to a standalone, a replica-set
+           primary, or the master of a master-slave set.
+
+        .. versionadded:: 2.3
+        """
+        return self.__is_primary
+
+    @property
+    def is_mongos(self):
+        """If this Connection is connected to mongos.
+
+        .. versionadded:: 2.3
+        """
+        return self.__is_mongos
+
+    @property
     def max_pool_size(self):
         """The maximum pool size limit set for this connection.
 
@@ -480,18 +510,20 @@ class Connection(common.BaseObject):
         """Send a command to the server.
         """
         rqst_id, msg, _ = message.query(0, dbname + '.$cmd', 0, -1, spec)
+        start = time.time()
         sock_info.sock.sendall(msg)
         response = self.__receive_message_on_socket(1, rqst_id, sock_info)
+        end = time.time()
         response = helpers._unpack_response(response)['data'][0]
         msg = "command %r failed: %%s" % spec
         helpers._check_command_response(response, None, msg)
-        return response
+        return response, end - start
 
     def __auth(self, sock_info, dbname, user, passwd):
         """Authenticate socket against database `dbname`.
         """
         # Get a nonce
-        response = self.__simple_command(sock_info, dbname, {'getnonce': 1})
+        response, _ = self.__simple_command(sock_info, dbname, {'getnonce': 1})
         nonce = response['nonce']
         key = helpers._auth_key(nonce, user, passwd)
 
@@ -501,21 +533,30 @@ class Connection(common.BaseObject):
         self.__simple_command(sock_info, dbname, query)
 
     def __try_node(self, node):
-        """Try to connect to this node and see if it works
-        for our connection type.
+        """Try to connect to this node and see if it works for our connection
+        type. Returns ((host, port), ismaster, isdbgrid, res_time).
 
         :Parameters:
          - `node`: The (host, port) pair to try.
         """
         self.disconnect()
         self.__host, self.__port = node
-        response = self.admin.command("ismaster")
+
+        # Call 'ismaster' directly so we can get a response time.
+        sock_info = self.__socket()
+        response, res_time = self.__simple_command(sock_info,
+                                                   'admin',
+                                                   {'ismaster': 1})
+        self.__pool.maybe_return_socket(sock_info)
+
+        # Are we talking to a mongos?
+        isdbgrid = response.get('msg', '') == 'isdbgrid'
 
         if "maxBsonObjectSize" in response:
             self.__max_bson_size = response["maxBsonObjectSize"]
 
         # Replica Set?
-        if len(self.__nodes) > 1 or self.__repl:
+        if not self.__direct:
             # Check that this host is part of the given replica set.
             if self.__repl:
                 set_name = response.get('setName')
@@ -527,10 +568,14 @@ class Connection(common.BaseObject):
                                              "replica set %s"
                                              % (node[0], node[1], self.__repl))
             if "hosts" in response:
-                self.__nodes.update([_partition_node(h)
-                                     for h in response["hosts"]])
+                self.__nodes = set([_partition_node(h)
+                                    for h in response["hosts"]])
+            else:
+                # The user passed a seed list of standalone or
+                # mongos instances.
+                self.__nodes.add(node)
             if response["ismaster"]:
-                return node
+                return node, True, isdbgrid, res_time
             elif "primary" in response:
                 candidate = _partition_node(response["primary"])
                 return self.__try_node(candidate)
@@ -539,46 +584,81 @@ class Connection(common.BaseObject):
             raise AutoReconnect('%s:%d is not primary or master' % node)
 
         # Direct connection
-        if response.get("arbiterOnly", False):
+        if response.get("arbiterOnly", False) and not self.__direct:
             raise ConfigurationError("%s:%d is an arbiter" % node)
+        return node, response['ismaster'], isdbgrid, res_time
+
+    def __pick_nearest(self, candidates):
+        """Return the 'nearest' candidate based on response time.
+        """
+        latency = self.secondary_acceptable_latency_ms
+        # Only used for mongos high availability, res_time is in seconds.
+        fastest = min([res_time for candidate, res_time in candidates])
+        near_candidates = [
+            candidate for candidate, res_time in candidates
+            if res_time - fastest < latency / 1000.0
+        ]
+
+        node = random.choice(near_candidates)
+        # Clear the pool from the last choice.
+        self.disconnect()
+        self.__host, self.__port = node
         return node
 
-    def __find_node(self):
+    def __find_node(self, seeds=None):
         """Find a host, port pair suitable for our connection type.
 
         If only one host was supplied to __init__ see if we can connect
         to it. Don't check if the host is a master/primary so we can make
-        a direct connection to read from a slave.
+        a direct connection to read from a secondary or send commands to
+        an arbiter.
 
         If more than one host was supplied treat them as a seed list for
-        connecting to a replica set. Try to find the primary and fail if
-        we can't. Possibly updates any replSet information on success.
+        connecting to a replica set or to support high availability for
+        mongos. If connecting to a replica set try to find the primary
+        and fail if we can't, possibly updating any replSet information
+        on success. If a mongos seed list was provided find the "nearest"
+        mongos and return it.
 
-        If the list of hosts is not a seed list for a replica set the
-        behavior is still the same. We iterate through the list trying
-        to find a host we can send write operations to.
-
-        In either case a connection to an arbiter will never succeed.
+        Otherwise we iterate through the list trying to find a host we can
+        send write operations to.
 
         Sets __host and __port so that :attr:`host` and :attr:`port`
-        will return the address of the connected host.
+        will return the address of the connected host. Sets __is_primary to
+        True if this is a primary or master, else False. Sets __is_mongos
+        to True if the connection is to a mongos.
         """
         errors = []
-        # self.__nodes may change size as we iterate.
-        seeds = self.__nodes.copy()
-        for candidate in seeds:
+        mongos_candidates = []
+        candidates = seeds or self.__nodes.copy()
+        for candidate in candidates:
             try:
-                node = self.__try_node(candidate)
-                if node:
-                    return node
+                node, ismaster, isdbgrid, res_time = self.__try_node(candidate)
+                self.__is_primary = ismaster
+                self.__is_mongos = isdbgrid
+                # No need to calculate nearest if we only have one mongos.
+                if isdbgrid and not self.__direct:
+                    mongos_candidates.append((node, res_time))
+                    continue
+                elif len(mongos_candidates):
+                    raise ConfigurationError("Seed list cannot contain a mix "
+                                             "of mongod and mongos instances.")
+                return node
             except Exception, why:
                 errors.append(str(why))
-        # Try any hosts we discovered that were not in the seed list.
-        for candidate in self.__nodes - seeds:
+
+        # If we have a mongos seed list, pick the "nearest" member.
+        if len(mongos_candidates):
+            self.__is_mongos = True
+            return self.__pick_nearest(mongos_candidates)
+
+        # Otherwise, try any hosts we discovered that were not in the seed list.
+        for candidate in self.__nodes - candidates:
             try:
-                node = self.__try_node(candidate)
-                if node:
-                    return node
+                node, ismaster, isdbgrid, _ = self.__try_node(candidate)
+                self.__is_primary = ismaster
+                self.__is_mongos = isdbgrid
+                return node
             except Exception, why:
                 errors.append(str(why))
         # Couldn't find a suitable host.
@@ -684,13 +764,22 @@ class Connection(common.BaseObject):
             self.disconnect()
             raise AutoReconnect(error_msg)
 
-        if "code" in error:
-            if error["code"] in [11000, 11001, 12582]:
-                raise DuplicateKeyError(error["err"])
+        details = error
+        # mongos returns the error code in an error object
+        # for some errors.
+        if "errObjects" in error:
+            for errobj in error["errObjects"]:
+                if errobj["err"] == error_msg:
+                    details = errobj
+                    break
+
+        if "code" in details:
+            if details["code"] in [11000, 11001, 12582]:
+                raise DuplicateKeyError(details["err"])
             else:
-                raise OperationFailure(error["err"], error["code"])
+                raise OperationFailure(details["err"], details["code"])
         else:
-            raise OperationFailure(error["err"])
+            raise OperationFailure(details["err"])
 
     def __check_bson_size(self, message):
         """Make sure the message doesn't include BSON documents larger

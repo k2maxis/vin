@@ -16,14 +16,14 @@
 
 import warnings
 
-from bson.binary import OLD_UUID_SUBTYPE, UUID_SUBTYPE
+from bson.binary import ALL_UUID_SUBTYPES, OLD_UUID_SUBTYPE
 from bson.code import Code
 from bson.son import SON
 from pymongo import (common,
                      helpers,
                      message)
 from pymongo.cursor import Cursor
-from pymongo.errors import ConfigurationError, InvalidName, InvalidOperation
+from pymongo.errors import ConfigurationError, InvalidName
 
 
 def _gen_index_name(keys):
@@ -74,11 +74,14 @@ class Collection(common.BaseObject):
 
         .. mongodoc:: collections
         """
-        super(Collection,
-              self).__init__(slave_okay=database.slave_okay,
-                             read_preference=database.read_preference,
-                             safe=database.safe,
-                             **(database.get_lasterror_options()))
+        super(Collection, self).__init__(
+            slave_okay=database.slave_okay,
+            read_preference=database.read_preference,
+            tag_sets=database.tag_sets,
+            secondary_acceptable_latency_ms=(
+                database.secondary_acceptable_latency_ms),
+            safe=database.safe,
+            **(database.get_lasterror_options()))
 
         if not isinstance(name, basestring):
             raise TypeError("name must be an instance "
@@ -174,15 +177,22 @@ class Collection(common.BaseObject):
         return self.__uuid_subtype
 
     def __set_uuid_subtype(self, subtype):
-        if subtype not in (OLD_UUID_SUBTYPE, UUID_SUBTYPE):
-            raise ConfigurationError("Not a valid binary subtype for a UUID.")
+        if subtype not in ALL_UUID_SUBTYPES:
+            raise ConfigurationError("Not a valid setting for uuid_subtype.")
         self.__uuid_subtype = subtype
 
     uuid_subtype = property(__get_uuid_subtype, __set_uuid_subtype,
-                            doc="""The BSON binary subtype for
-                            a UUID used for this collection.""")
+                            doc="""This attribute specifies which BSON Binary
+                            subtype is used when storing UUIDs. Historically
+                            UUIDs have been stored as BSON Binary subtype 3.
+                            This attribute is used to switch to the newer BSON
+                            binary subtype 4. It can also be used to force
+                            legacy byte order and subtype compatibility with
+                            the Java and C# drivers. See the
+                            :mod:`bson.binary` module for all options.""")
 
-    def save(self, to_save, manipulate=True, safe=False, **kwargs):
+    def save(self, to_save, manipulate=True,
+             safe=None, check_keys=True, **kwargs):
         """Save a document in this collection.
 
         If `to_save` already has an ``"_id"`` then an :meth:`update`
@@ -211,6 +221,9 @@ class Collection(common.BaseObject):
           - `manipulate` (optional): manipulate the document before
             saving it?
           - `safe` (optional): check that the save succeeded?
+          - `check_keys` (optional): check if keys start with '$' or
+            contain '.', raising :class:`~pymongo.errors.InvalidName`
+            in either case.
           - `**kwargs` (optional): any additional arguments imply
             ``safe=True``, and will be used as options for the
             `getLastError` command
@@ -225,14 +238,14 @@ class Collection(common.BaseObject):
             raise TypeError("cannot save object of type %s" % type(to_save))
 
         if "_id" not in to_save:
-            return self.insert(to_save, manipulate, safe, **kwargs)
+            return self.insert(to_save, manipulate, safe, check_keys, **kwargs)
         else:
             self.update({"_id": to_save["_id"]}, to_save, True,
-                        manipulate, safe, _check_keys=True, **kwargs)
+                        manipulate, safe, _check_keys=check_keys, **kwargs)
             return to_save.get("_id", None)
 
     def insert(self, doc_or_docs, manipulate=True,
-               safe=False, check_keys=True, continue_on_error=False, **kwargs):
+               safe=None, check_keys=True, continue_on_error=False, **kwargs):
         """Insert a document(s) into this collection.
 
         If `manipulate` is ``True``, the document(s) are manipulated using
@@ -295,21 +308,17 @@ class Collection(common.BaseObject):
         if manipulate:
             docs = [self.__database._fix_incoming(doc, self) for doc in docs]
 
-        if self.safe or kwargs:
-            safe = True
-            if not kwargs:
-                kwargs.update(self.get_lasterror_options())
-
+        safe, options = self._get_safe_and_lasterror_options(safe, **kwargs)
         self.__database.connection._send_message(
             message.insert(self.__full_name, docs,
-                           check_keys, safe, kwargs,
+                           check_keys, safe, options,
                            continue_on_error, self.__uuid_subtype), safe)
 
         ids = [doc.get("_id", None) for doc in docs]
         return return_one and ids[0] or ids
 
     def update(self, spec, document, upsert=False, manipulate=False,
-               safe=False, multi=False, _check_keys=False, **kwargs):
+               safe=None, multi=False, _check_keys=False, **kwargs):
         """Update a document(s) in this collection.
 
         Raises :class:`TypeError` if either `spec` or `document` is
@@ -391,17 +400,14 @@ class Collection(common.BaseObject):
         if manipulate:
             document = self.__database._fix_incoming(document, self)
 
-        if self.safe or kwargs:
-            safe = True
-            if not kwargs:
-                kwargs.update(self.get_lasterror_options())
+        safe, options = self._get_safe_and_lasterror_options(safe, **kwargs)
 
         # _check_keys is used by save() so we don't upsert pre-existing
         # documents after adding an invalid key like 'a.b'. It can't really
         # be used for any other update operations.
         return self.__database.connection._send_message(
             message.update(self.__full_name, upsert, multi,
-                           spec, document, safe, kwargs,
+                           spec, document, safe, options,
                            _check_keys, self.__uuid_subtype), safe)
 
     def drop(self):
@@ -416,7 +422,7 @@ class Collection(common.BaseObject):
         """
         self.__database.drop_collection(self.__name)
 
-    def remove(self, spec_or_id=None, safe=False, **kwargs):
+    def remove(self, spec_or_id=None, safe=None, **kwargs):
         """Remove a document(s) from this collection.
 
         .. warning:: Calls to :meth:`remove` should be performed with
@@ -471,14 +477,10 @@ class Collection(common.BaseObject):
         if not isinstance(spec_or_id, dict):
             spec_or_id = {"_id": spec_or_id}
 
-        if self.safe or kwargs:
-            safe = True
-            if not kwargs:
-                kwargs.update(self.get_lasterror_options())
-
+        safe, options = self._get_safe_and_lasterror_options(safe, **kwargs)
         return self.__database.connection._send_message(
-            message.delete(self.__full_name, spec_or_id,
-                           safe, kwargs, self.__uuid_subtype), safe)
+            message.delete(self.__full_name, spec_or_id, safe,
+                           options, self.__uuid_subtype), safe)
 
     def find_one(self, spec_or_id=None, *args, **kwargs):
         """Get a single document from the database.
@@ -586,12 +588,19 @@ class Collection(common.BaseObject):
             :class:`~pymongo.connection.Connection`-level default
           - `read_preference` (optional): The read preference for
             this query.
+          - `tag_sets` (optional): The tag sets for this query.
+          - `secondary_acceptable_latency_ms` (optional): Any replica-set
+            member whose ping time is within secondary_acceptable_latency_ms of
+            the nearest member may accept reads. Default 15 milliseconds.
 
         .. note:: The `manipulate` parameter may default to False in
            a future release.
 
         .. note:: The `max_scan` parameter requires server
            version **>= 1.5.1**
+
+        .. versionadded:: 2.3
+           The `tag_sets` and `secondary_acceptable_latency_ms` parameters.
 
         .. versionadded:: 1.11+
            The `await_data`, `partial`, and `manipulate` parameters.
@@ -615,6 +624,11 @@ class Collection(common.BaseObject):
             kwargs['slave_okay'] = self.slave_okay
         if not 'read_preference' in kwargs:
             kwargs['read_preference'] = self.read_preference
+        if not 'tag_sets' in kwargs:
+            kwargs['tag_sets'] = self.tag_sets
+        if not 'secondary_acceptable_latency_ms' in kwargs:
+            kwargs['secondary_acceptable_latency_ms'] = (
+                self.secondary_acceptable_latency_ms)
         return Cursor(self, *args, **kwargs)
 
     def count(self):
@@ -625,7 +639,7 @@ class Collection(common.BaseObject):
         """
         return self.find().count()
 
-    def create_index(self, key_or_list, ttl=300, **kwargs):
+    def create_index(self, key_or_list, cache_for=300, **kwargs):
         """Creates an index on this collection.
 
         Takes either a single key or a list of (key, direction) pairs.
@@ -662,13 +676,18 @@ class Collection(common.BaseObject):
         :Parameters:
           - `key_or_list`: a single key or a list of (key, direction)
             pairs specifying the index to create
-          - `ttl` (optional): time window (in seconds) during which
+          - `cache_for` (optional): time window (in seconds) during which
             this index will be recognized by subsequent calls to
             :meth:`ensure_index` - see documentation for
             :meth:`ensure_index` for details
           - `**kwargs` (optional): any additional index creation
             options (see the above list) should be passed as keyword
             arguments
+          - `ttl` (deprecated): Use `cache_for` instead.
+
+        .. versionchanged:: 2.3
+            The `ttl` parameter has been deprecated to avoid confusion with
+            TTL collections.  Use `cache_for` instead.
 
         .. versionchanged:: 2.2
            Removed deprecated argument: deprecated_unique
@@ -683,6 +702,12 @@ class Collection(common.BaseObject):
 
         .. mongodoc:: indexes
         """
+
+        if 'ttl' in kwargs:
+            cache_for = kwargs.pop('ttl')
+            warnings.warn("ttl is deprecated. Please use cache_for instead.",
+                          DeprecationWarning)
+
         keys = helpers._index_list(key_or_list)
         index_doc = helpers._index_document(keys)
 
@@ -704,11 +729,11 @@ class Collection(common.BaseObject):
                                               safe=True)
 
         self.__database.connection._cache_index(self.__database.name,
-                                                self.__name, name, ttl)
+                                                self.__name, name, cache_for)
 
         return name
 
-    def ensure_index(self, key_or_list, ttl=300, **kwargs):
+    def ensure_index(self, key_or_list, cache_for=300, **kwargs):
         """Ensures that an index exists on this collection.
 
         Takes either a single key or a list of (key, direction) pairs.
@@ -754,12 +779,17 @@ class Collection(common.BaseObject):
         :Parameters:
           - `key_or_list`: a single key or a list of (key, direction)
             pairs specifying the index to create
-          - `ttl` (optional): time window (in seconds) during which
+          - `cache_for` (optional): time window (in seconds) during which
             this index will be recognized by subsequent calls to
             :meth:`ensure_index`
           - `**kwargs` (optional): any additional index creation
             options (see the above list) should be passed as keyword
             arguments
+          - `ttl` (deprecated): Use `cache_for` instead.
+
+        .. versionchanged:: 2.3
+            The `ttl` parameter has been deprecated to avoid confusion with
+            TTL collections.  Use `cache_for` instead.
 
         .. versionchanged:: 2.2
            Removed deprecated argument: deprecated_unique
@@ -780,7 +810,7 @@ class Collection(common.BaseObject):
 
         if not self.__database.connection._cached(self.__database.name,
                                                   self.__name, name):
-            return self.create_index(key_or_list, ttl, **kwargs)
+            return self.create_index(key_or_list, cache_for, **kwargs)
         return None
 
     def drop_indexes(self):
@@ -889,6 +919,44 @@ class Collection(common.BaseObject):
 
         return options
 
+    def aggregate(self, pipeline):
+        """Perform an aggregation using the aggregation framework on this
+        collection.
+
+        With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
+        or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
+        if the `read_preference` attribute of this instance is not set to
+        :attr:`pymongo.ReadPreference.PRIMARY` or the (deprecated)
+        `slave_okay` attribute of this instance is set to `True` the
+        `aggregate command`_. will be sent to a secondary or slave.
+
+        :Parameters:
+          - `pipeline`: a single command or list of aggregation commands
+
+        .. note:: Requires server version **>= 2.1.0**
+
+        .. versionadded:: 2.3
+
+        .. _aggregate command:
+            http://docs.mongodb.org/manual/applications/aggregation
+        """
+        if not isinstance(pipeline, (dict, list, tuple)):
+            raise TypeError("pipeline must be a dict, list or tuple")
+
+        if isinstance(pipeline, dict):
+            pipeline = [pipeline]
+
+        use_master = not self.slave_okay and not self.read_preference
+
+        return self.__database.command("aggregate", self.__name,
+                                        pipeline=pipeline,
+                                        read_preference=self.read_preference,
+                                        tag_sets=self.tag_sets,
+                                        secondary_acceptable_latency_ms=(
+                                         self.secondary_acceptable_latency_ms),
+                                        slave_okay=self.slave_okay,
+                                        _use_master=use_master)
+
     # TODO key and condition ought to be optional, but deprecation
     # could be painful as argument order would have to change.
     def group(self, key, condition, initial, reduce, finalize=None):
@@ -909,9 +977,10 @@ class Collection(common.BaseObject):
         With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
         if the `read_preference` attribute of this instance is not set to
-        :attr:`pymongo.ReadPreference.PRIMARY` or the (deprecated)
-        `slave_okay` attribute of this instance is set to `True` the group
-        command will be sent to a secondary or slave.
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY_PREFERRED`, or
+        the (deprecated) `slave_okay` attribute of this instance is set to
+        `True`, the group command will be sent to a secondary or slave.
 
         :Parameters:
           - `key`: fields to group by (see above description)
@@ -949,6 +1018,9 @@ class Collection(common.BaseObject):
         return self.__database.command("group", group,
                                        uuid_subtype=self.__uuid_subtype,
                                        read_preference=self.read_preference,
+                                       tag_sets=self.tag_sets,
+                                       secondary_acceptable_latency_ms=(
+                                           self.secondary_acceptable_latency_ms),
                                        slave_okay=self.slave_okay,
                                        _use_master=use_master)["retval"]
 
@@ -1031,7 +1103,7 @@ class Collection(common.BaseObject):
 
         .. note:: Requires server version **>= 1.1.1**
 
-        .. seealso:: :doc:`/examples/map_reduce`
+        .. seealso:: :doc:`/examples/aggregation`
 
         .. versionchanged:: 2.2
            Removed deprecated arguments: merge_output and reduce_output
@@ -1049,10 +1121,20 @@ class Collection(common.BaseObject):
             raise TypeError("'out' must be an instance of "
                             "%s or dict" % (basestring.__name__,))
 
+        if isinstance(out, dict) and out.get('inline'):
+            must_use_master = False
+        else:
+            must_use_master = True
+
         response = self.__database.command("mapreduce", self.__name,
                                            uuid_subtype=self.__uuid_subtype,
                                            map=map, reduce=reduce,
-                                           out=out, **kwargs)
+                                           read_preference=self.read_preference,
+                                           tag_sets=self.tag_sets,
+                                           secondary_acceptable_latency_ms=(
+                                               self.secondary_acceptable_latency_ms),
+                                           out=out, _use_master=must_use_master,
+                                           **kwargs)
 
         if full_response or not response.get('result'):
             return response
@@ -1077,9 +1159,10 @@ class Collection(common.BaseObject):
         With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
         if the `read_preference` attribute of this instance is not set to
-        :attr:`pymongo.ReadPreference.PRIMARY` or the (deprecated)
-        `slave_okay` attribute of this instance is set to `True` the inline
-        map reduce will be run on a secondary or slave.
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY_PREFERRED`, or
+        the (deprecated) `slave_okay` attribute of this instance is set to
+        `True`, the inline map reduce will be run on a secondary or slave.
 
         :Parameters:
           - `map`: map function (as a JavaScript string)
@@ -1102,6 +1185,9 @@ class Collection(common.BaseObject):
         res = self.__database.command("mapreduce", self.__name,
                                       uuid_subtype=self.__uuid_subtype,
                                       read_preference=self.read_preference,
+                                      tag_sets=self.tag_sets,
+                                      secondary_acceptable_latency_ms=(
+                                          self.secondary_acceptable_latency_ms),
                                       slave_okay=self.slave_okay,
                                       _use_master=use_master,
                                       map=map, reduce=reduce,

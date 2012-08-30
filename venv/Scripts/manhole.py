@@ -1,16 +1,5 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
-# Copyright (c) Twisted Matrix Laboratories.
-# See LICENSE for details.
-
-"""
-This script runs GtkManhole, a client for Twisted.Manhole
-"""
-import sys
-
-try:
-    import _preamble
-except ImportError:
-    sys.exc_clear()
-
-from twisted.scripts import manhole
-manhole.run()
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
+# EASY-INSTALL-SCRIPT: 'Twisted==12.1.0','manhole.py'
+__requires__ = 'Twisted==12.1.0'
+import pkg_resources
+pkg_resources.run_script('Twisted==12.1.0', 'manhole.py')

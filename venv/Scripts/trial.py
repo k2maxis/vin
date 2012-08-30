@@ -1,18 +1,5 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
-# Copyright (c) Twisted Matrix Laboratories.
-# See LICENSE for details.
-import os, sys
-
-try:
-    import _preamble
-except ImportError:
-    sys.exc_clear()
-
-# begin chdir armor
-sys.path[:] = map(os.path.abspath, sys.path)
-# end chdir armor
-
-sys.path.insert(0, os.path.abspath(os.getcwd()))
-
-from twisted.scripts.trial import run
-run()
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
+# EASY-INSTALL-SCRIPT: 'Twisted==12.1.0','trial.py'
+__requires__ = 'Twisted==12.1.0'
+import pkg_resources
+pkg_resources.run_script('Twisted==12.1.0', 'trial.py')

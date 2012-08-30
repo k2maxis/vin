@@ -1,0 +1,3 @@
+twisted/internet/iocpreactor/iocpsupport.pyd
+twisted/python/_initgroups.pyd
+twisted/test/raiser.pyd

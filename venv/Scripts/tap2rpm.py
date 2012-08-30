@@ -1,19 +1,5 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
-# Copyright (c) Twisted Matrix Laboratories.
-# See LICENSE for details.
-
-#  based off the tap2deb code
-#  tap2rpm built by Sean Reifschneider, <jafo@tummy.com>
-
-"""
-tap2rpm
-"""
-import sys
-
-try:
-    import _preamble
-except ImportError:
-    sys.exc_clear()
-
-from twisted.scripts import tap2rpm
-tap2rpm.run()
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
+# EASY-INSTALL-SCRIPT: 'Twisted==12.1.0','tap2rpm.py'
+__requires__ = 'Twisted==12.1.0'
+import pkg_resources
+pkg_resources.run_script('Twisted==12.1.0', 'tap2rpm.py')

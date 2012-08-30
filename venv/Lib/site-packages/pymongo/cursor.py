@@ -13,12 +13,12 @@
 # limitations under the License.
 
 """Cursor class to iterate over Mongo query results."""
+from collections import deque
 
 from bson.code import Code
 from bson.son import SON
-from pymongo import (helpers,
-                     message,
-                     ReadPreference)
+from pymongo import helpers, message, read_preferences
+from pymongo.read_preferences import ReadPreference
 from pymongo.errors import (InvalidOperation,
                             AutoReconnect)
 
@@ -43,7 +43,8 @@ class Cursor(object):
                  timeout=True, snapshot=False, tailable=False, sort=None,
                  max_scan=None, as_class=None, slave_okay=False,
                  await_data=False, partial=False, manipulate=True,
-                 read_preference=ReadPreference.PRIMARY,
+                 read_preference=ReadPreference.PRIMARY, tag_sets=[{}],
+                 secondary_acceptable_latency_ms=None,
                  _must_use_master=False, _uuid_subtype=None, **kwargs):
         """Create a new cursor.
 
@@ -113,12 +114,14 @@ class Cursor(object):
         self.__slave_okay = slave_okay
         self.__manipulate = manipulate
         self.__read_preference = read_preference
+        self.__tag_sets = tag_sets
+        self.__secondary_acceptable_latency_ms = secondary_acceptable_latency_ms
         self.__tz_aware = collection.database.connection.tz_aware
         self.__must_use_master = _must_use_master
         self.__uuid_subtype = _uuid_subtype or collection.uuid_subtype
         self.__query_flags = 0
 
-        self.__data = []
+        self.__data = deque()
         self.__connection_id = None
         self.__retrieved = 0
         self.__killed = False
@@ -149,7 +152,7 @@ class Cursor(object):
         be sent to the server, even if the resultant data has already been
         retrieved by this cursor.
         """
-        self.__data = []
+        self.__data = deque()
         self.__id = None
         self.__connection_id = None
         self.__retrieved = 0
@@ -179,6 +182,9 @@ class Cursor(object):
         copy.__partial = self.__partial
         copy.__manipulate = self.__manipulate
         copy.__read_preference = self.__read_preference
+        copy.__tag_sets = self.__tag_sets
+        copy.__secondary_acceptable_latency_ms = (
+            self.__secondary_acceptable_latency_ms)
         copy.__must_use_master = self.__must_use_master
         copy.__uuid_subtype = self.__uuid_subtype
         copy.__query_flags = self.__query_flags
@@ -217,6 +223,14 @@ class Cursor(object):
             operators["$snapshot"] = True
         if self.__max_scan:
             operators["$maxScan"] = self.__max_scan
+        if self.__collection.database.connection.is_mongos:
+            read_pref = {
+                'mode': read_preferences.mongos_mode(self.__read_preference)}
+
+            if self.__tag_sets and self.__tag_sets != [{}]:
+                read_pref['tags'] = self.__tag_sets
+
+            operators['$readPreference'] = read_pref
 
         if operators:
             # Make a shallow copy so we can cleanly rewind or clone.
@@ -243,7 +257,9 @@ class Cursor(object):
         options = self.__query_flags
         if self.__tailable:
             options |= _QUERY_OPTIONS["tailable_cursor"]
-        if self.__slave_okay or self.__read_preference:
+        if (self.__slave_okay
+            or self.__read_preference != ReadPreference.PRIMARY
+        ):
             options |= _QUERY_OPTIONS["slave_okay"]
         if not self.__timeout:
             options |= _QUERY_OPTIONS["no_timeout"]
@@ -474,8 +490,10 @@ class Cursor(object):
 
         With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
-        if `read_preference` is not :attr:`pymongo.ReadPreference.PRIMARY` or
-        (deprecated) `slave_okay` is `True` the count command will be sent to
+        if `read_preference` is not
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY_PREFERRED`, or
+        (deprecated) `slave_okay` is `True`, the count command will be sent to
         a secondary or slave.
 
         :Parameters:
@@ -494,6 +512,9 @@ class Cursor(object):
         command = {"query": self.__spec, "fields": self.__fields}
 
         command['read_preference'] = self.__read_preference
+        command['tag_sets'] = self.__tag_sets
+        command['secondary_acceptable_latency_ms'] = (
+            self.__secondary_acceptable_latency_ms)
         command['slave_okay'] = self.__slave_okay
         use_master = not self.__slave_okay and not self.__read_preference
         command['_use_master'] = use_master
@@ -522,7 +543,8 @@ class Cursor(object):
 
         With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
-        if `read_preference` is not :attr:`pymongo.ReadPreference.PRIMARY` or
+        if `read_preference` is
+        not :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
         (deprecated) `slave_okay` is `True` the distinct command will be sent
         to a secondary or slave.
 
@@ -544,6 +566,9 @@ class Cursor(object):
             options["query"] = self.__spec
 
         options['read_preference'] = self.__read_preference
+        options['tag_sets'] = self.__tag_sets
+        options['secondary_acceptable_latency_ms'] = (
+            self.__secondary_acceptable_latency_ms)
         options['slave_okay'] = self.__slave_okay
         use_master = not self.__slave_okay and not self.__read_preference
         options['_use_master'] = use_master
@@ -629,6 +654,9 @@ class Cursor(object):
         db = self.__collection.database
         kwargs = {"_must_use_master": self.__must_use_master}
         kwargs["read_preference"] = self.__read_preference
+        kwargs["tag_sets"] = self.__tag_sets
+        kwargs["secondary_acceptable_latency_ms"] = (
+            self.__secondary_acceptable_latency_ms)
         if self.__connection_id is not None:
             kwargs["_connection_to_use"] = self.__connection_id
         kwargs.update(self.__kwargs)
@@ -654,7 +682,8 @@ class Cursor(object):
         try:
             response = helpers._unpack_response(response, self.__id,
                                                 self.__as_class,
-                                                self.__tz_aware)
+                                                self.__tz_aware,
+                                                self.__uuid_subtype)
         except AutoReconnect:
             # Don't send kill cursors to another server after a "not master"
             # error. It's completely pointless.
@@ -670,7 +699,7 @@ class Cursor(object):
                     response['starting_from'], self.__retrieved))
 
         self.__retrieved += response["number_returned"]
-        self.__data = response["data"]
+        self.__data = deque(response["data"])
 
         if self.__limit and self.__id and self.__limit <= self.__retrieved:
             self.__die()
@@ -748,9 +777,10 @@ class Cursor(object):
         db = self.__collection.database
         if len(self.__data) or self._refresh():
             if self.__manipulate:
-                return db._fix_outgoing(self.__data.pop(0), self.__collection)
+                return db._fix_outgoing(self.__data.popleft(),
+                                        self.__collection)
             else:
-                return self.__data.pop(0)
+                return self.__data.popleft()
         else:
             raise StopIteration
 
@@ -759,4 +789,3 @@ class Cursor(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.__die()
-

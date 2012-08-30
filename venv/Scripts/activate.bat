@@ -1,5 +1,5 @@
 @echo off
-set VIRTUAL_ENV=C:\Users\JJ\Documents\Coding\VIN\venv
+set VIRTUAL_ENV=C:\Users\JJ\Documents\Coding\Scott\VIN\venv
 
 if not defined PROMPT (
     set PROMPT=$P$G

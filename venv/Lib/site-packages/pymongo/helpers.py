@@ -26,6 +26,7 @@ import struct
 import bson
 import pymongo
 
+from bson.binary import OLD_UUID_SUBTYPE
 from bson.son import SON
 from pymongo.errors import (AutoReconnect,
                             OperationFailure,
@@ -74,7 +75,8 @@ def _index_document(index_list):
     return index
 
 
-def _unpack_response(response, cursor_id=None, as_class=dict, tz_aware=False):
+def _unpack_response(response, cursor_id=None,
+                     as_class=dict, tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE):
     """Unpack a response from the database.
 
     Check the response for errors and unpack, returning a dictionary
@@ -105,28 +107,41 @@ def _unpack_response(response, cursor_id=None, as_class=dict, tz_aware=False):
     result["cursor_id"] = struct.unpack("<q", response[4:12])[0]
     result["starting_from"] = struct.unpack("<i", response[12:16])[0]
     result["number_returned"] = struct.unpack("<i", response[16:20])[0]
-    result["data"] = bson.decode_all(response[20:], as_class, tz_aware)
+    result["data"] = bson.decode_all(response[20:],
+                                     as_class, tz_aware, uuid_subtype)
     assert len(result["data"]) == result["number_returned"]
     return result
 
 
 def _check_command_response(response, reset, msg="%s", allowable_errors=[]):
+
     if not response["ok"]:
         if "wtimeout" in response and response["wtimeout"]:
             raise TimeoutError(msg % response["errmsg"])
-        if not response["errmsg"] in allowable_errors:
-            if response["errmsg"] == "not master":
+
+        details = response
+        # Mongos returns the error details in a 'raw' object
+        # for some errors.
+        if "raw" in response:
+            for shard in response["raw"].itervalues():
+                if not shard.get("ok"):
+                    # Just grab the first error...
+                    details = shard
+                    break
+
+        if not details["errmsg"] in allowable_errors:
+            if details["errmsg"] == "not master":
                 if reset is not None:
                     reset()
                 raise AutoReconnect("not master")
-            if response["errmsg"] == "db assertion failure":
+            if details["errmsg"] == "db assertion failure":
                 ex_msg = ("db assertion failure, assertion: '%s'" %
-                          response.get("assertion", ""))
-                if "assertionCode" in response:
+                          details.get("assertion", ""))
+                if "assertionCode" in details:
                     ex_msg += (", assertionCode: %d" %
-                               (response["assertionCode"],))
-                raise OperationFailure(ex_msg, response.get("assertionCode"))
-            raise OperationFailure(msg % response["errmsg"])
+                               (details["assertionCode"],))
+                raise OperationFailure(ex_msg, details.get("assertionCode"))
+            raise OperationFailure(msg % details["errmsg"])
 
 
 def _password_digest(username, password):

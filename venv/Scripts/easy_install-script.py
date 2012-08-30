@@ -1,4 +1,4 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
 # EASY-INSTALL-ENTRY-SCRIPT: 'setuptools==0.6c11','console_scripts','easy_install'
 __requires__ = 'setuptools==0.6c11'
 import sys

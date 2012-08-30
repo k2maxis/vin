@@ -1,16 +1,5 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
-# Copyright (c) Twisted Matrix Laboratories.
-# See LICENSE for details.
-
-import sys, os
-extra = os.path.dirname(os.path.dirname(sys.argv[0]))
-sys.path.insert(0, extra)
-try:
-    import _preamble
-except ImportError:
-    sys.exc_clear()
-sys.path.remove(extra)
-
-from twisted.lore.scripts.lore import run
-run()
-
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
+# EASY-INSTALL-SCRIPT: 'Twisted==12.1.0','lore.py'
+__requires__ = 'Twisted==12.1.0'
+import pkg_resources
+pkg_resources.run_script('Twisted==12.1.0', 'lore.py')

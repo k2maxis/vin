@@ -1,4 +1,4 @@
-#!C:\Users\JJ\Documents\Coding\VIN\venv\Scripts\python.exe
+#!C:\Users\JJ\Documents\Coding\Scott\VIN\venv\Scripts\python.exe
 # EASY-INSTALL-ENTRY-SCRIPT: 'pip==1.1','console_scripts','pip'
 __requires__ = 'pip==1.1'
 import sys
